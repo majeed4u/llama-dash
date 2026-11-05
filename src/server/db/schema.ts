@@ -326,6 +326,8 @@ export const providerConnections = sqliteTable('provider_connections', {
   credentialId: text('credential_id').notNull(),
   routingRuleIdsJson: text('routing_rule_ids_json').notNull().default('[]'),
   modelsJson: text('models_json').notNull().default('[]'),
+  /** Discovered models per API surface (keyed by surface mount path). */
+  modelsBySurfaceJson: text('models_by_surface_json').notNull().default('{}'),
   modelsDiscoveredAt: integer('models_discovered_at', { mode: 'timestamp_ms' }),
   enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
   createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),

@@ -1,0 +1,1 @@
+ALTER TABLE `provider_connections` ADD `models_by_surface_json` text DEFAULT '{}' NOT NULL;

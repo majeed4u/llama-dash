@@ -81,6 +81,8 @@ export type ProviderEndpoint = {
   targetId: string
   label: string
   apiStyle: ProviderApiStyle
+  /** Mount path of this surface on the target origin, e.g. `/api/paas/v4`. */
+  surfacePath: string
   baseUrl: string
   pathJoin: ProviderPathJoin
   matchEndpoints: string[]
@@ -239,6 +241,7 @@ export const PROVIDER_ENDPOINTS: readonly ProviderEndpoint[] = PROVIDER_TARGETS.
     targetId: target.id,
     label: `${target.label} · ${surface.apiStyle}`,
     apiStyle: surface.apiStyle,
+    surfacePath: surface.path,
     baseUrl: joinUrl(target.origin, surface.path),
     pathJoin: surface.pathJoin,
     matchEndpoints: surface.matchEndpoints,

@@ -7,6 +7,7 @@ import {
   providerAuthValue,
   providerEndpointForBaseUrl,
   providerModelsUrl,
+  type ProviderSurface,
   type ProviderTarget,
 } from '../../lib/providers.ts'
 import { db, schema } from '../db/index.ts'
@@ -31,7 +32,9 @@ import {
  *
  * 1. one encrypted upstream credential holding the provider key,
  * 2. one routing rule per API surface the target exposes, and
- * 3. an auto-discovered model list, fetched live from the provider.
+ * 3. an auto-discovered model list, fetched live from the provider — stored per
+ *    surface, because the OpenAI/Anthropic/Responses surfaces of one target do
+ *    not serve identical model sets.
  *
  * The rules are created at the top of the order so they win over catch-all
  * rules the operator already has.
@@ -56,6 +59,20 @@ function parseJsonStringArray(raw: string): string[] {
   }
 }
 
+function parseJsonObjectStringArray(raw: string): Record<string, string[]> {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, string[]> = {}
+    for (const [key, value] of Object.entries(parsed)) {
+      if (Array.isArray(value)) out[key] = value.filter((item): item is string => typeof item === 'string')
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
 function toApiShape(row: schema.ProviderConnection): ProviderConnection {
   const target = findProviderTarget(row.targetId)
   const credential = db
@@ -71,6 +88,7 @@ function toApiShape(row: schema.ProviderConnection): ProviderConnection {
     credentialName: credential?.name ?? 'unknown',
     routingRuleIds: parseJsonStringArray(row.routingRuleIdsJson),
     models: parseJsonStringArray(row.modelsJson),
+    modelsBySurface: parseJsonObjectStringArray(row.modelsBySurfaceJson),
     modelsDiscoveredAt: row.modelsDiscoveredAt?.toISOString() ?? null,
     enabled: row.enabled,
     createdAt: row.createdAt.toISOString(),
@@ -99,56 +117,116 @@ export function providerApiKey(targetId: string): string | null {
   return secret?.value ?? null
 }
 
-async function probeSurfaceModels(
-  target: ProviderTarget,
-  apiKey: string,
-): Promise<{
+/** Result of probing one surface's model listing. */
+type SurfaceProbe = {
+  /** Surface mount path — the key used in `modelsBySurface`. */
+  path: string
   ok: boolean
   status: number
   latencyMs: number
   message: string
   models: string[]
-}> {
-  let lastStatus = 0
-  let lastMessage = 'No surface responded'
-  let lastLatency = 0
-  for (const surface of target.surfaces) {
-    const url = providerModelsUrl(`${target.origin.replace(/\/$/, '')}${surface.path}`, surface.pathJoin)
-    const headers: Record<string, string> = {}
-    for (const binding of surface.authHeaders) {
-      headers[binding.name] = providerAuthValue(binding, apiKey)
-    }
-    const startedAt = Date.now()
-    try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers,
-        signal: AbortSignal.timeout(15_000),
-      })
-      lastLatency = Date.now() - startedAt
-      lastStatus = response.status
-      if (!response.ok) {
-        const detail = (await response.text().catch(() => '')).slice(0, 200)
-        lastMessage = `Provider returned ${response.status}${detail ? ` — ${detail}` : ''}`
-        continue
-      }
-      const result = v.safeParse(ModelsListSchema, await response.json().catch(() => ({})))
-      const models = result.success
-        ? (result.output.data ?? []).map((entry) => entry.id).filter((id): id is string => Boolean(id))
-        : []
+}
+
+/** Result of probing every surface of one target. */
+type TargetProbe = {
+  ok: boolean
+  status: number
+  latencyMs: number
+  message: string
+  models: string[]
+  modelsBySurface: Record<string, string[]>
+}
+
+async function probeSurface(target: ProviderTarget, surface: ProviderSurface, apiKey: string): Promise<SurfaceProbe> {
+  const url = providerModelsUrl(`${target.origin.replace(/\/$/, '')}${surface.path}`, surface.pathJoin)
+  const headers: Record<string, string> = {}
+  for (const binding of surface.authHeaders) {
+    headers[binding.name] = providerAuthValue(binding, apiKey)
+  }
+  const startedAt = Date.now()
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(15_000),
+    })
+    const latencyMs = Date.now() - startedAt
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => '')).slice(0, 200)
       return {
-        ok: true,
+        path: surface.path,
+        ok: false,
         status: response.status,
-        latencyMs: lastLatency,
-        message: `Provider reachable and key accepted · ${models.length} models`,
-        models,
+        latencyMs,
+        message: `Provider returned ${response.status}${detail ? ` — ${detail}` : ''}`,
+        models: [],
       }
-    } catch (err) {
-      lastLatency = Date.now() - startedAt
-      lastMessage = err instanceof Error ? err.message : String(err)
+    }
+    const result = v.safeParse(ModelsListSchema, await response.json().catch(() => ({})))
+    const models = result.success
+      ? (result.output.data ?? []).map((entry) => entry.id).filter((id): id is string => Boolean(id))
+      : []
+    return {
+      path: surface.path,
+      ok: true,
+      status: response.status,
+      latencyMs,
+      message: `${models.length} models`,
+      models,
+    }
+  } catch (err) {
+    return {
+      path: surface.path,
+      ok: false,
+      status: 0,
+      latencyMs: Date.now() - startedAt,
+      message: err instanceof Error ? err.message : String(err),
+      models: [],
     }
   }
-  return { ok: false, status: lastStatus, latencyMs: lastLatency, message: lastMessage, models: [] }
+}
+
+/**
+ * Probe every surface of a target. Each surface is asked for its own model
+ * listing — the OpenAI/Anthropic/Responses mounts of one subscription do not
+ * serve identical model sets, so a per-surface split is what routing rules
+ * need to claim only models their surface actually serves.
+ */
+async function probeSurfaceModels(target: ProviderTarget, apiKey: string): Promise<TargetProbe> {
+  const probes: SurfaceProbe[] = []
+  for (const surface of target.surfaces) {
+    probes.push(await probeSurface(target, surface, apiKey))
+  }
+
+  const modelsBySurface: Record<string, string[]> = {}
+  for (const probe of probes) modelsBySurface[probe.path] = probe.models
+  // Union in surface order, deduplicated, for the flat connection model list.
+  const models = [...new Set(probes.flatMap((probe) => probe.models))]
+
+  const okProbe = probes.find((probe) => probe.ok)
+  const failedCount = probes.filter((probe) => !probe.ok).length
+  if (!okProbe) {
+    const last = probes[probes.length - 1]
+    return {
+      ok: false,
+      status: last?.status ?? 0,
+      latencyMs: last?.latencyMs ?? 0,
+      message: last?.message ?? 'No surface responded',
+      models: [],
+      modelsBySurface,
+    }
+  }
+  return {
+    ok: true,
+    status: okProbe.status,
+    latencyMs: okProbe.latencyMs,
+    message: `Provider reachable and key accepted · ${models.length} models${
+      failedCount > 0 ? ` · ${failedCount} of ${probes.length} surfaces failed to list models` : ''
+    }`,
+    models,
+    modelsBySurface,
+  }
 }
 
 /** Probe a target to confirm the key works and discover its models. */
@@ -177,27 +255,31 @@ export async function refreshProviderModels(targetId: string): Promise<ProviderC
   db.update(schema.providerConnections)
     .set({
       modelsJson: JSON.stringify(probe.models),
+      modelsBySurfaceJson: JSON.stringify(probe.modelsBySurface),
       modelsDiscoveredAt: probe.models.length > 0 ? now : null,
       updatedAt: now,
     })
     .where(eq(schema.providerConnections.id, connection.id))
     .run()
 
-  // Re-scope each rule to the refreshed model list and the catalog's current
-  // endpoint claims, so provider rules never claim models the provider doesn't
-  // serve (and disable them when it serves none we know of).
+  // Re-scope each rule to its own surface's refreshed model list and the
+  // catalog's current endpoint claims, so provider rules never claim models
+  // their surface doesn't serve (and disable them when it serves none we know
+  // of). Rules whose target left the catalog are left untouched.
   const rulesById = new Map(listRoutingRules().map((rule) => [rule.id, rule]))
   for (const ruleId of connection.routingRuleIds) {
     const rule = rulesById.get(ruleId)
     if (!rule) continue
     const surface = rule.target.type === 'direct' ? providerEndpointForBaseUrl(rule.target.baseUrl) : undefined
+    if (!surface) continue
+    const surfaceModels = probe.modelsBySurface[surface.surfacePath] ?? []
     updateRoutingRule(ruleId, {
       match: {
         ...rule.match,
-        endpoints: surface ? [...surface.matchEndpoints] : rule.match.endpoints,
-        requestedModels: [...probe.models],
+        endpoints: [...surface.matchEndpoints],
+        requestedModels: [...surfaceModels],
       },
-      enabled: probe.models.length > 0,
+      enabled: surfaceModels.length > 0,
     })
   }
 
@@ -228,18 +310,21 @@ export async function connectProvider(input: ConnectProviderBody): Promise<Provi
   const probe = await probeSurfaceModels(target, apiKey)
 
   // One routing rule per surface: each claims only that surface's proxy
-  // endpoints and ONLY the models this provider actually serves — a rule with
-  // an empty model list would hijack every request, including local
-  // llama-swap models. Rules stay disabled until models are discovered.
+  // endpoints and ONLY the models this surface actually serves — the OpenAI,
+  // Anthropic, and Responses mounts of one subscription do not share a model
+  // set, and a rule with an empty model list would hijack every request,
+  // including local llama-swap models. Rules stay disabled until their surface
+  // has discovered models.
   const ruleIds: string[] = []
   try {
     for (const surface of target.surfaces) {
+      const surfaceModels = probe.modelsBySurface[surface.path] ?? []
       const rule = createRoutingRule({
-        name: `${target.label} · ${surface.apiStyle}`,
-        enabled: probe.models.length > 0,
+        name: `${target.label} · ${surface.apiStyle} (${surface.path})`,
+        enabled: surfaceModels.length > 0,
         match: {
           endpoints: [...surface.matchEndpoints],
-          requestedModels: [...probe.models],
+          requestedModels: [...surfaceModels],
           apiKeyIds: [],
           stream: 'any' as const,
           minEstimatedPromptTokens: '',
@@ -282,6 +367,7 @@ export async function connectProvider(input: ConnectProviderBody): Promise<Provi
       credentialId: credential.id,
       routingRuleIdsJson: JSON.stringify(ruleIds),
       modelsJson: JSON.stringify(probe.models),
+      modelsBySurfaceJson: JSON.stringify(probe.modelsBySurface),
       modelsDiscoveredAt: probe.models.length > 0 ? now : null,
       enabled: true,
       createdAt: now,

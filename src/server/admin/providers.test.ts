@@ -54,6 +54,10 @@ it('connecting a target wires one credential, one rule per surface, and discover
 
   // Models come from the provider's listing, not from a hardcoded table.
   expect(connection.models).toEqual(['mimo-v2.6-pro', 'mimo-v2.6-flash'])
+  expect(connection.modelsBySurface).toEqual({
+    '/v1': ['mimo-v2.6-pro', 'mimo-v2.6-flash'],
+    '/anthropic': ['mimo-v2.6-pro', 'mimo-v2.6-flash'],
+  })
   expect(connection.modelsDiscoveredAt).not.toBeNull()
 
   // One routing rule per surface (OpenAI + Anthropic), both with the credential.
@@ -84,6 +88,7 @@ it('connecting without a reachable models listing still works with an empty mode
   const connection = await providers.connectProvider({ targetId: 'minimax', apiKey: 'sk-minimax' })
 
   expect(connection.models).toEqual([])
+  expect(connection.modelsBySurface).toEqual({ '/v1': [], '/anthropic': [] })
   expect(connection.modelsDiscoveredAt).toBeNull()
   expect(connection.routingRuleIds).toHaveLength(2)
   // With no known models the rules stay disabled so they can't hijack traffic.
@@ -135,4 +140,83 @@ it('refresh re-discovers models and re-scopes the routing rules', async () => {
     expect(rule.match.requestedModels).toEqual(['new-model-a', 'new-model-b'])
     expect(rule.enabled).toBe(true)
   }
+})
+
+it('discovers models per surface and scopes each routing rule to its own surface', async () => {
+  const fetchMock = vi.fn(async (url: string | URL | Request) => {
+    const href = String(url)
+    if (href.includes('/api/paas/v4/models')) return modelsResponse(['glm-4.7', 'glm-4.5v'])
+    if (href.includes('/api/anthropic/v1/models')) return modelsResponse(['glm-4.6', 'glm-4.7'])
+    if (href.includes('/api/v1/models')) return modelsResponse(['glm-ruminate'])
+    return new Response('not found', { status: 404 })
+  })
+  const { providers, rules } = await loadProviderModule(fetchMock as unknown as typeof fetch)
+
+  const connection = await providers.connectProvider({ targetId: 'zai', apiKey: 'sk-zai' })
+
+  // The flat list is the deduplicated union in surface order; the split keeps
+  // each surface's own truth.
+  expect(connection.models).toEqual(['glm-4.7', 'glm-4.5v', 'glm-4.6', 'glm-ruminate'])
+  expect(connection.modelsBySurface).toEqual({
+    '/api/paas/v4': ['glm-4.7', 'glm-4.5v'],
+    '/api/anthropic': ['glm-4.6', 'glm-4.7'],
+    '/api/v1': ['glm-ruminate'],
+  })
+
+  const rulesByBase = new Map(
+    rules.listRoutingRules().map((rule) => [rule.target.type === 'direct' ? rule.target.baseUrl : '', rule] as const),
+  )
+  const chatRule = rulesByBase.get('https://api.z.ai/api/paas/v4')!
+  expect(chatRule.match.endpoints).toEqual([
+    '/v1/chat/completions',
+    '/v1/completions',
+    '/v1/audio/speech',
+    '/v1/audio/transcriptions',
+    '/v1/images/generations',
+  ])
+  expect(chatRule.match.requestedModels).toEqual(['glm-4.7', 'glm-4.5v'])
+
+  const anthropicRule = rulesByBase.get('https://api.z.ai/api/anthropic')!
+  expect(anthropicRule.match.endpoints).toEqual(['/v1/messages', '/v1/messages/count_tokens'])
+  expect(anthropicRule.match.requestedModels).toEqual(['glm-4.6', 'glm-4.7'])
+
+  const responsesRule = rulesByBase.get('https://api.z.ai/api/v1')!
+  expect(responsesRule.match.endpoints).toEqual(['/v1/responses'])
+  expect(responsesRule.match.requestedModels).toEqual(['glm-ruminate'])
+
+  for (const rule of rules.listRoutingRules()) expect(rule.enabled).toBe(true)
+})
+
+it('refresh re-scopes each rule to its own surface and disables surfaces that stop listing', async () => {
+  let respond: (href: string) => Response = () => modelsResponse(['glm-4.7'])
+  const fetchMock = vi.fn(async (url: string | URL | Request) => respond(String(url)))
+  const { providers, rules } = await loadProviderModule(fetchMock as unknown as typeof fetch)
+
+  await providers.connectProvider({ targetId: 'zai', apiKey: 'sk-zai' })
+
+  respond = (href) => {
+    if (href.includes('/api/paas/v4/models')) return modelsResponse(['glm-4.7', 'glm-5'])
+    if (href.includes('/api/anthropic/v1/models')) return new Response('down', { status: 500 })
+    return modelsResponse(['glm-ruminate'])
+  }
+  const connection = await providers.refreshProviderModels('zai')
+
+  expect(connection.models).toEqual(['glm-4.7', 'glm-5', 'glm-ruminate'])
+  expect(connection.modelsBySurface).toEqual({
+    '/api/paas/v4': ['glm-4.7', 'glm-5'],
+    '/api/anthropic': [],
+    '/api/v1': ['glm-ruminate'],
+  })
+
+  const rulesByBase = new Map(
+    rules.listRoutingRules().map((rule) => [rule.target.type === 'direct' ? rule.target.baseUrl : '', rule] as const),
+  )
+  expect(rulesByBase.get('https://api.z.ai/api/paas/v4')!.match.requestedModels).toEqual(['glm-4.7', 'glm-5'])
+  expect(rulesByBase.get('https://api.z.ai/api/paas/v4')!.enabled).toBe(true)
+  // The Anthropic surface listed nothing this round — its rule stops claiming
+  // models and disables instead of hijacking every /v1/messages request.
+  expect(rulesByBase.get('https://api.z.ai/api/anthropic')!.match.requestedModels).toEqual([])
+  expect(rulesByBase.get('https://api.z.ai/api/anthropic')!.enabled).toBe(false)
+  expect(rulesByBase.get('https://api.z.ai/api/v1')!.match.requestedModels).toEqual(['glm-ruminate'])
+  expect(rulesByBase.get('https://api.z.ai/api/v1')!.enabled).toBe(true)
 })

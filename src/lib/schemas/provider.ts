@@ -15,8 +15,13 @@ export const ProviderConnectionSchema = v.object({
   credentialId: v.string(),
   credentialName: v.string(),
   routingRuleIds: v.array(v.string()),
-  /** Auto-discovered from the provider's `/v1/models` listing. */
+  /** Auto-discovered from the provider's `/v1/models` listing — union of every surface. */
   models: v.array(v.string()),
+  /**
+   * The same discovery keyed by API surface mount path (e.g. `/api/paas/v4`,
+   * `/api/anthropic`), so routing rules only claim models their surface serves.
+   */
+  modelsBySurface: v.record(v.string(), v.array(v.string())),
   modelsDiscoveredAt: v.nullable(v.string()),
   enabled: v.boolean(),
   createdAt: v.string(),
@@ -52,7 +57,9 @@ export const ProviderTestResultSchema = v.object({
   status: v.number(),
   latencyMs: v.number(),
   message: v.string(),
-  /** Models discovered during the probe. */
+  /** Models discovered during the probe — union of every surface that answered. */
   models: v.array(v.string()),
+  /** The same discovery keyed by API surface mount path. */
+  modelsBySurface: v.record(v.string(), v.array(v.string())),
 })
 export type ProviderTestResult = v.InferOutput<typeof ProviderTestResultSchema>

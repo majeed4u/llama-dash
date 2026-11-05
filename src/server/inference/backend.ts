@@ -52,6 +52,18 @@ export type BackendModelCapabilities = {
   supportedParameters: Array<string>
 }
 
+/**
+ * One entry of an OpenAI-shaped `/v1/models` listing. Backend-specific
+ * capability metadata rides along verbatim in the extra keys.
+ */
+export type BackendOpenAiModelEntry = {
+  id: string
+  object: 'model'
+  created: number
+  owned_by: string
+  [extra: string]: unknown
+}
+
 export type BackendRunningModel = {
   model: string
   state: string
@@ -66,6 +78,8 @@ export type InferenceBackend = {
   defaultProxyUpstream(pathname: string, search: string): string
   eventStreamUrl?: string
   listModels(): Promise<Array<BackendModel>>
+  /** Raw `/v1/models` entries when the backend can supply them, metadata intact. */
+  listOpenAiModels?(): Promise<Array<BackendOpenAiModelEntry>>
   listRunning?(): Promise<Array<BackendRunningModel>>
   hardware?(): Promise<InferenceHardware>
   modelLogNames?(modelId: string): Array<string>

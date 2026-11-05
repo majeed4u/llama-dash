@@ -138,6 +138,12 @@ export function createLlamaSwapBackend(): InferenceBackend {
       const models = await llamaSwap.listModels()
       return models.data.map(mapLlamaSwapModel)
     },
+    // The upstream OpenAI-shaped entries pass through verbatim — v229
+    // capability metadata included — so proxy clients keep seeing it.
+    async listOpenAiModels() {
+      const models = await llamaSwap.listModels()
+      return models.data
+    },
     async listRunning() {
       const { running } = await llamaSwap.listRunning()
       return running.map(mapLlamaSwapRunningModel)

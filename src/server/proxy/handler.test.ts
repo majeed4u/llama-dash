@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ProviderConnection } from '../../lib/schemas/provider'
 import type { RoutingRule } from '../../lib/schemas/routing-rule'
 import type { ApiKey } from '../db/schema'
 import { handleProxyRequest } from './handler'
@@ -70,6 +71,27 @@ vi.mock('./rate-limiter.ts', () => ({
   checkTpm: () => ({ allowed: true }),
   recordTokenUsage: vi.fn(),
 }))
+
+// Provider connections back the merged /v1/models catalog.
+const providersMock = vi.hoisted(() => ({
+  list: vi.fn<() => import('../../lib/schemas/provider').ProviderConnection[]>(() => []),
+}))
+
+vi.mock('../admin/providers.ts', () => ({ listProviderConnections: providersMock.list }))
+
+// The real inference backend would talk to the network; stub its surface so
+// existing upstream expectations (http://llama-swap.test/…) hold and the model
+// listing is controllable.
+const backendMock = vi.hoisted(() => ({
+  inferenceBackend: {
+    defaultProxyUpstream: (pathname: string, search: string) => `http://llama-swap.test${pathname}${search}`,
+    listOpenAiModels: vi.fn(
+      async (): Promise<Array<{ id: string; object: 'model'; created: number; owned_by: string }>> => [],
+    ),
+  },
+}))
+
+vi.mock('../inference/backend.ts', () => backendMock)
 
 // The real forward uses undici's `fetch`, which cannot be replaced via
 // vi.stubGlobal('fetch'). Mock the forward layer so routing/rewrite decisions
@@ -501,5 +523,65 @@ describe('handleProxyRequest auth/body ordering', () => {
       },
     })
     expect(forwardUpstreamAndLog).not.toHaveBeenCalled()
+  })
+})
+
+function makeConnection(): ProviderConnection {
+  return {
+    id: 'prv_test',
+    targetId: 'zai',
+    targetLabel: 'Z.AI GLM · Pay-as-you-go',
+    credentialId: 'ucr_test',
+    credentialName: 'Z.AI key',
+    routingRuleIds: [],
+    models: ['glm-4.7', 'glm-4.5v'],
+    modelsBySurface: { '/api/paas/v4': ['glm-4.7', 'glm-4.5v'] },
+    modelsDiscoveredAt: new Date(0).toISOString(),
+    enabled: true,
+    createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+    updatedAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+  }
+}
+
+describe('GET /v1/models merged catalog', () => {
+  beforeEach(() => {
+    routingRulesMock.listRoutingRules.mockReturnValue([])
+    apiKeysMock.hasAnyUserKeys.mockReturnValue(true)
+    apiKeysMock.findKeyByHash.mockReturnValue(undefined)
+    forwardMock.forwardUpstreamAndLog.mockClear()
+    providersMock.list.mockReset().mockReturnValue([])
+    backendMock.inferenceBackend.listOpenAiModels
+      .mockReset()
+      .mockResolvedValue([{ id: 'llama3-8b', object: 'model', created: 1, owned_by: 'llama-swap' }])
+  })
+
+  it('answers locally with backend and provider models instead of forwarding', async () => {
+    const rawKey = 'sk-list'
+    apiKeysMock.findKeyByHash.mockReturnValue(makeKey(rawKey))
+    providersMock.list.mockReturnValue([makeConnection()])
+    const request = new Request('http://dash.test/v1/models', {
+      headers: { authorization: `Bearer ${rawKey}` },
+    })
+
+    const response = await handleProxyRequest(request)
+
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body.object).toBe('list')
+    expect(body.data.map((entry: { id: string }) => entry.id)).toEqual(['llama3-8b', 'glm-4.7', 'glm-4.5v'])
+    expect(forwardUpstreamAndLog).not.toHaveBeenCalled()
+  })
+
+  it('still forwards GET /v1/models when a routing rule targets a direct upstream', async () => {
+    routingRulesMock.listRoutingRules.mockReturnValue([
+      makeRule({ match: { ...makeRule().match, endpoints: ['/v1/models'] } }),
+    ])
+    const request = new Request('http://dash.test/v1/models')
+
+    const response = await handleProxyRequest(request)
+
+    expect(response.status).toBe(200)
+    expect(lastForward().upstream).toBe('https://api.openai.com/v1/models')
+    expect(backendMock.inferenceBackend.listOpenAiModels).not.toHaveBeenCalled()
   })
 })

@@ -13,6 +13,7 @@ import {
 } from './context.ts'
 import { toErrorBody } from './errors.ts'
 import { forwardUpstreamAndLog, nullUsage, writeProxyLog } from './forward.ts'
+import { serveModelsListing } from './models-listing.ts'
 import { resolveProxyRouting, shouldPreserveAuthorization } from './routing.ts'
 import { applyTransforms, routingOutcomeFromDecision, type RoutingOutcome } from './transforms.ts'
 import { applyCredentialInjection, auditToJson } from './credential-placeholders.ts'
@@ -140,6 +141,13 @@ export async function handleProxyRequest(request: Request): Promise<Response> {
   }
 
   finalizeRoutingAndBody(ctx)
+
+  // GET /v1/models is answered from the merged catalog (inference backend +
+  // connected provider subscriptions) instead of being forwarded — unless a
+  // routing rule explicitly sends this request to a direct upstream.
+  if (ctx.method === 'GET' && ctx.endpoint === '/v1/models' && ctx.routingOutcome.targetType !== 'direct') {
+    return serveModelsListing(ctx)
+  }
 
   if (ctx.endpoint === '/v1/audio/llama-tts') {
     const model = ctx.body?.parsedBody?.model

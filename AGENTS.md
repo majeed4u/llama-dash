@@ -101,7 +101,7 @@ src/
     gpu-poller.ts         — polls nvidia-smi/rocm-smi/system_profiler and combines hardware telemetry
     model-watcher.ts      — polls /running every 15s, writes load/unload events
     db/                   — drizzle schema + SQLite init; migrations are applied explicitly with pnpm db:migrate
-    proxy/                — /v1/* pass-through: context, handler, auth, body snapshots, transforms, forwarding, usage, queued logging, rate limits
+    proxy/                — /v1/* pass-through: context, handler, auth, body snapshots, transforms, forwarding, usage, queued logging, rate limits, merged /v1/models listing
     admin/                  — /api/* admin surface: dispatcher plus grouped routes/, requests, model-events, model-detail, key-detail, api-keys, aliases, settings, events, providers
     inference/            — selected inference backend facade plus backend-specific adapters and hints
     llama-swap/client.ts  — typed wrapper over llama-swap's HTTP API
@@ -120,7 +120,7 @@ paths (proxy will grow middleware; admin will grow CRUD).
 
 ## How it's wired
 
-- `src/server/proxy/*` — the `/v1/*`, native llama.cpp `/infill`, and llama-swap `/audiocpp/*` pass-through; `/v1/audio/llama-tts` routes native speech to the selected model's llama-swap upstream: streaming SSE preserved, proxy context/body snapshots kept isolated, bounded request/response capture for logs, token counts scraped from responses as they fly by, and one queued SQLite row per completed request.
+- `src/server/proxy/*` — the `/v1/*`, native llama.cpp `/infill`, and llama-swap `/audiocpp/*` pass-through; `/v1/audio/llama-tts` routes native speech to the selected model's llama-swap upstream: streaming SSE preserved, proxy context/body snapshots kept isolated, bounded request/response capture for logs, token counts scraped from responses as they fly by, and one queued SQLite row per completed request. `GET /v1/models` is answered locally from a merged catalog — the inference backend's raw listing (capability metadata intact) plus every enabled provider connection's discovered models — filtered by the calling key's model access (`models-listing.ts`); routing rules that target a direct upstream for it still forward.
 - `src/server/pricing.ts` — startup-cached `models.dev` model pricing used to estimate logged request cost from upstream usage counters.
 - `src/server/admin/*` — the `/api/*` admin surface consumed by the UI, with grouped route modules under `src/server/admin/routes/*` for models, requests, config, keys, aliases, routing, MCP relays, upstream credentials, settings, and system health. JSON GET responses support conditional ETag polling, `/api/events` streams lightweight dashboard events, and `/api/log-events` streams llama-swap logs only while the Logs page is mounted.
 - `src/server/article-extract.ts` — server-side article URL fetcher for the Speech playground. It validates public HTTP(S) URLs, caps HTML fetch size/time, parses readable article text with Readability, and returns editable text for TTS.
@@ -181,6 +181,13 @@ paths (proxy will grow middleware; admin will grow CRUD).
    Streaming inference requests also store proxy-observed time to first meaningful
    output and the span between first and last output deltas as nullable integers,
    independent of body capture. These are not upstream prefill/decode timings.
+   `GET /v1/models` is served locally from a merged catalog instead of being
+   forwarded: the inference backend's raw OpenAI-shaped listing plus every
+   enabled provider connection's discovered models, deduplicated (backend wins
+   id ties) and filtered by the calling key's model access. The exchange is
+   logged metadata-only. A routing rule that targets a direct upstream for
+   `/v1/models` still forwards; see
+   [`docs/2026_11_06_merged_models_listing.md`](./docs/2026_11_06_merged_models_listing.md).
 4. Inference backend facade (`src/server/inference/*`). The selected singleton
    backend currently supports `llama-swap` only and normalizes model list,
    running-model state, health, proxy upstream selection, lifecycle actions,
@@ -217,8 +224,8 @@ paths (proxy will grow middleware; admin will grow CRUD).
     - `/api/aliases` — CRUD for model aliases (global model name mapping)
     - `/api/routing-rules` — CRUD + reorder for ordered routing rules
     - `/api/upstream-credentials` — encrypted bearer credential vault for direct upstream routing and MCP relays
-    - `/api/providers` — list connected provider targets with auto-discovered models
-    - `/api/providers/connect` — connect a subscription (one key wires every API surface; creates the credential, one routing rule per surface, and discovers models from the provider's `/v1/models`)
+    - `/api/providers` — list connected provider targets with auto-discovered models (flat union plus a per-API-surface split)
+    - `/api/providers/connect` — connect a subscription (one key wires every API surface; creates the credential, one routing rule per surface scoped to that surface's own discovered models, and discovers models from each surface's `/models` listing)
     - `/api/providers/disconnect`, `/api/providers/test`, `/api/providers/models/refresh`
    - `/api/mcp-relays` — CRUD for configured remote MCP relay endpoints
    - `/api/settings/attribution` — GET/PATCH header mappings for client/end-user/session capture
@@ -692,7 +699,7 @@ sort lexicographically by creation time).
 - `GET /upstream/:model_id/*` — proxy directly to a specific llama-server (useful for `/metrics`)
 - `GET /logs/stream`, `/logs/stream/proxy`, `/logs/stream/upstream`, `/logs/stream/{model_id}` — SSE log streams
 - `GET /health`
-- `GET /v1/models` — OpenAI-format list including peers and v229 capability metadata
+- `GET /v1/models` — OpenAI-format list including peers and v229 capability metadata. The proxy no longer forwards client `GET /v1/models` here by default: it answers from this listing merged with connected provider models (`src/server/proxy/models-listing.ts`); llama-swap is still the source of the backend half.
 - Hot reload: editing `config.yaml` when llama-swap runs with `-watch-config` triggers the stat-poll watcher; SIGHUP reload is also supported by llama-swap.
 
 **CLI flags**: `-config <path>`, `-listen <addr>` (default `:8080`), `-watch-config`, `-tls-cert-file`, `-tls-key-file`, `-version`.

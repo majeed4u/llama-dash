@@ -13,4 +13,13 @@ describe('isInferenceProxyPath', () => {
     expect(isInferenceProxyPath('/login')).toBe(false)
     expect(isInferenceProxyPath('/')).toBe(false)
   })
+
+  it('accepts clients that spell the version segment with uppercase', () => {
+    // /V1/responses must reach the proxy, not fall through to the SPA HTML shell.
+    expect(isInferenceProxyPath('/V1/responses')).toBe(true)
+    expect(isInferenceProxyPath('/V1/models')).toBe(true)
+    expect(isInferenceProxyPath('/V1/Chat/Completions')).toBe(true)
+    expect(isInferenceProxyPath('/Infill')).toBe(true)
+    expect(isInferenceProxyPath('/V1')).toBe(true)
+  })
 })

@@ -44,13 +44,16 @@ export type ProxyContext = {
 export function createProxyContext(request: Request): ProxyContext {
   const method = request.method.toUpperCase()
   const url = new URL(request.url)
-  const defaultUpstream = inferenceBackend.defaultProxyUpstream(url.pathname, url.search)
+  // Upstream APIs use lowercase paths; normalize so /V1/… clients still match
+  // routing rules and land on real upstream routes instead of 404s.
+  const endpoint = url.pathname.toLowerCase()
+  const defaultUpstream = inferenceBackend.defaultProxyUpstream(endpoint, url.search)
   return {
     request,
     startedAt: Date.now(),
     method,
     url,
-    endpoint: url.pathname,
+    endpoint,
     defaultUpstream,
     upstream: defaultUpstream,
     reqHeaders: forwardableRequestHeaders(request.headers),
